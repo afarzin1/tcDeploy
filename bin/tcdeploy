@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# tcdeploy -- activate a COMMITTED, PUSHED sha onto the target PLC. The gated verb (design §5).
+#
+# This restarts the PLC. Outputs drop, non-persistent state is lost. There is no
+# scripted no-downtime path (design §8) -- that is why the ADS pre-flight guard
+# exists and why this must never be allowlisted in Claude Code.
+#
+# The build box runs NO git. Everything git-shaped happens
+# here, where the repo and the credentials are:
+#   1. the working tree must be exactly <sha>: clean (submodule included) and HEAD == sha
+#   2. <sha> must be reachable from origin (pushed) -- the deploy record must point
+#      at history the world can see
+#   3. `tcsync --full` ships the tree plus a per-file SHA-256 manifest
+#   4. the box verifies the tree against that manifest, clean-builds, guards, activates
+#   5. on success the deploy tag is created and pushed FROM HERE
+# tcDeploy deploys the PLC project only. It never downloads, checks or gates on
+# the TwinSAFE project; that is a separate, manual process.
+# The box needs no clone, no credentials and no PATH entry for git.
+
+set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_tclib.sh"
+tc_load_config
+
+assume_yes=0; allow_unpushed=0; dry_run=0; sha_arg=""
+
+usage() {
+  cat <<USAGE
+usage: tcdeploy <sha|HEAD> [--yes] [--allow-unpushed] [--dry-run]
+
+  <sha>                   commit to deploy. The working tree must be checked out
+                          at it and clean -- the box builds what tcsync sends.
+  --yes                   skip the interactive confirmation
+  --allow-unpushed        deploy a commit that is not on origin yet (the deploy
+                          tag will then point at history only you can see)
+  --dry-run               run every check and the sync, print the job that
+                          WOULD be submitted, then stop. Touches nothing on the rig.
+
+exit codes: 0 deployed and in Run; 1 build failed; 2 refused here (tree/sha);
+            11 deployed and in Run, but the Analytics Storage Provider stopped recording;
+            4 rig busy (ADS guard); 5 activated, not in Run;
+            6 synced tree failed the manifest check on the box;
+            7 no boot project for BUILD_PLATFORM after the build;
+            8 target does not identify as EXPECTED_HOSTNAME; 9 in Run but unhealthy;
+            10 generated configuration incomplete (e.g. Analytics node dropped)
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --yes|-y)              assume_yes=1 ;;
+    --allow-unpushed)      allow_unpushed=1 ;;
+    --dry-run|-n)          dry_run=1 ;;
+    -h|--help)             usage; exit 0 ;;
+    -*)                    tc_die "unknown argument: $1 (see --help)" ;;
+    *)                     sha_arg="$1" ;;
+  esac
+  shift
+done
+
+[[ -n "$sha_arg" ]] || { usage >&2; tc_die "no sha given"; }
+tc_require_target
+tc_require_platform
+
+sha=$(tc_git rev-parse --verify "${sha_arg}^{commit}" 2>/dev/null) \
+  || tc_die "not a commit in $REPO_LOCAL: $sha_arg"
+short=$(tc_git rev-parse --short "$sha")
+subject=$(tc_git log -1 --format=%s "$sha")
+
+# --- 1. the working tree IS the thing being deployed ------------------------
+head=$(tc_head_sha)
+if [[ "$head" != "$sha" ]]; then
+  tc_err "HEAD is $(tc_git rev-parse --short "$head"), not $short. The box builds the synced working tree,"
+  tc_err "so it must be checked out at the commit you are deploying:  git -C $REPO_LOCAL checkout $short"
+  exit 2
+fi
+dirty=$(tc_git status --porcelain 2>/dev/null || true)
+subdirty=$(tc_git submodule status --recursive 2>/dev/null | grep -E '^[+U-]' || true)
+if [[ -n "$dirty" || -n "$subdirty" ]]; then
+  tc_err "working tree is not exactly $short -- refusing to deploy something the record cannot describe:"
+  [[ -n "$dirty" ]]    && printf '%s\n' "$dirty"    | sed 's/^/    /' >&2
+  [[ -n "$subdirty" ]] && printf '%s\n' "$subdirty" | sed 's/^/    submodule /' >&2
+  tc_err "commit or stash first (untracked files count: tcsync would ship them)."
+  exit 2
+fi
+tc_log "working tree clean at $short"
+
+# --- 2. deploy only from something the world can see (§4.4 traceability) -----
+tc_git fetch --quiet origin 2>/dev/null || tc_warn "git fetch failed -- checking against local remote-tracking refs"
+if [[ -z "$(tc_git branch -r --contains "$sha" 2>/dev/null)" ]]; then
+  if (( allow_unpushed )); then
+    tc_warn "$short is not on any origin/* branch -- proceeding because --allow-unpushed"
+  else
+    tc_err "$short is not reachable from any origin/* branch. Push it first -- deploys come"
+    tc_err "from committed, pushed history, never from WIP (or pass --allow-unpushed)."
+    exit 2
+  fi
+fi
+
+# --- 3. ship the tree the box will build ------------------------------------
+tc_log "syncing the full tree ($SYNC_PATHS $FULL_SYNC_EXTRA) ..."
+"$TC_ROOT/bin/tcsync" --full || tc_die "sync failed -- nothing submitted"
+manifest_hash=$(tc_ps "\$p='${REMOTE_MANIFEST}'; if (Test-Path \$p) { (Get-FileHash -LiteralPath \$p -Algorithm SHA256).Hash.ToLower() }" 2>/dev/null | tr -d '\r\n ')
+[[ -n "$manifest_hash" ]] || tc_die "sync manifest missing on the box after tcsync -- aborting"
+tc_log "sync manifest ${manifest_hash:0:12}… is on the box"
+
+# --- 4. pre-flight the rig before asking for confirmation --------------------
+tc_log "reading target state ..."
+"$TC_ROOT/bin/tcstatus" || tc_warn "could not read target state; the worker will re-check before activating"
+
+jobid="deploy-$(tc_jobid)"
+job_json=$(printf '{"id":"%s","type":"deploy","sha":"%s","workdir":"%s","solution":"%s","manifest":"%s","netid":"%s","plcport":%s,"guardBools":%s,"guardStrings":%s,"configuration":"%s","platform":"%s","tsproj":"%s","mustContain":%s,"hostnameSymbol":"%s","expectedHostname":"%s","healthBools":%s,"healthTimeout":%s,"timeout":%s}' \
+    "$jobid" "$sha" "$(tc_json_win "$REMOTE_WORK")" "$SOLUTION" "$(tc_json_win "$REMOTE_MANIFEST")" "$TARGET_NETID" "$ADS_PLC_PORT" \
+    "$(tc_json_array "$ADS_GUARD_BOOLS")" "$(tc_json_array "$ADS_GUARD_STRINGS")" "$BUILD_CONFIGURATION" "$BUILD_PLATFORM" \
+    "$TSPROJ" "$(tc_json_array "$BOOT_CONFIG_MUST_CONTAIN")" "$ADS_HOSTNAME_SYMBOL" "$EXPECTED_HOSTNAME" "$(tc_json_array "$ADS_HEALTH_BOOLS")" "$ADS_HEALTH_TIMEOUT" "$JOB_TIMEOUT")
+
+# --- the gate ----------------------------------------------------------------
+cat >&2 <<BANNER
+
+${C_BLD}About to ACTIVATE ${PROJECT} onto the physical target${C_OFF}
+  target   ${TARGET_NETID}  (${TARGET_HOST:-no host configured})
+  commit   ${short}  ${subject}
+  build    ${BUILD_CONFIGURATION} | ${BUILD_PLATFORM}
+  machine  ${EXPECTED_HOSTNAME:-not checked}  (identity read from ${ADS_HOSTNAME_SYMBOL:-nothing} before activating)
+  health   ${ADS_HEALTH_BOOLS:-none configured}  within ${ADS_HEALTH_TIMEOUT}s after Run
+  tree     clean, synced, manifest ${manifest_hash:0:12}…
+  effect   ${C_RED}PLC RESTARTS -- outputs drop, non-persistent state is lost${C_OFF}
+
+BANNER
+
+if (( dry_run )); then
+  tc_log "${C_YEL}dry run${C_OFF} -- every check passed and the tree is synced. Job NOT submitted:"
+  printf '%s\n' "$job_json"
+  exit 0
+fi
+
+if (( ! assume_yes )); then
+  read -r -p "Type the short sha (${short}) to proceed: " typed
+  [[ "$typed" == "$short" ]] || tc_die "confirmation did not match -- aborted"
+fi
+
+tc_ssh_check
+
+# Watch the Analytics Storage Provider across the activation (read-only MQTT).
+# It sometimes stops recording this machine after a deploy and does not
+# restart by itself (docs/field-notes.md); not reproducible on demand, so
+# every deploy records the evidence: stream offline time, what the provider
+# logged, and whether its recording is still receiving.
+aly_pid=""; aly_out=""; aly_ev=""
+# The watcher reads broker and topics from the .tsproj's Analytics Logger; for
+# a project without one it prints nothing and this block stays silent.
+if [[ "$ANALYTICS_WATCH" != "off" ]]; then
+  aly_dir="${XDG_STATE_HOME:-$HOME/.local/state}/tcdeploy/analytics"; mkdir -p "$aly_dir"
+  aly_ev="$aly_dir/${PROJECT}-$(date -u +%Y%m%dT%H%M%SZ)-${short}.jsonl"
+  aly_out=$(mktemp)
+  ANALYTICS_WATCH="$ANALYTICS_WATCH" ANALYTICS_BROKER="$ANALYTICS_BROKER" ANALYTICS_TOPIC="$ANALYTICS_TOPIC" ANALYTICS_SETTLE="$ANALYTICS_SETTLE" TC_TSPROJ="$REPO_LOCAL/$TSPROJ" \
+    "$TC_ROOT/bin/tcanalytics" watch --evidence "$aly_ev" >"$aly_out" 2>&1 &
+  aly_pid=$!
+fi
+
+tc_submit_job "$jobid" "$job_json"
+
+rc=$(tc_wait_job "$jobid" "$JOB_TIMEOUT") || rc=124
+tc_fetch_log "$jobid"
+
+aly_rc=""; aly_summary=""
+if [[ -n "$aly_pid" ]]; then
+  if [[ "$rc" == "0" ]]; then
+    tc_log "checking the Analytics Storage Provider's recordings of this machine (up to ${ANALYTICS_SETTLE}s) ..."
+    kill -USR1 "$aly_pid" 2>/dev/null || true
+    wait "$aly_pid" && aly_rc=0 || aly_rc=$?
+    aly_summary=$(head -n1 "$aly_out")
+    tail -n +2 "$aly_out" | sed 's/^/    /' >&2
+    if [[ -n "$aly_summary" ]]; then
+      printf '%s\t%s\t%s\t%s\t%s\n' "$(date -u +%FT%TZ)" "$PROJECT" "$short" "$aly_rc" "$aly_summary" \
+        >> "$(dirname "$aly_ev")/history.tsv"
+    else
+      rm -f "$aly_ev"; aly_rc=""          # no Analytics Logger: nothing was watched
+    fi
+  else
+    kill -TERM "$aly_pid" 2>/dev/null || true; wait "$aly_pid" 2>/dev/null || true
+  fi
+  rm -f "$aly_out"
+fi
+
+# --- 5. the deploy record, written from the machine that can see origin -------
+if [[ "$rc" == "0" ]]; then
+  tag="${DEPLOY_TAG_PREFIX}/$(date -u +%Y%m%dT%H%M%SZ)"
+  msg=$(printf 'deployed %s to %s (%s)\n\nby: %s@%s\nsync-manifest: sha256 %s\njob: %s' \
+        "$sha" "$TARGET_NETID" "${EXPECTED_HOSTNAME:-unnamed}" "${USER:-unknown}" "$(hostname)" "$manifest_hash" "$jobid")
+  [[ -n "$aly_summary" ]] && msg+=$'\n'"$aly_summary"
+  if tc_git tag -a "$tag" -m "$msg" "$sha"; then
+    if tc_git push --quiet origin "$tag" 2>/dev/null; then
+      tc_log "${C_GRN}deployed${C_OFF} $short -> $TARGET_NETID, tagged and pushed $tag"
+    else
+      tc_warn "tagged $tag locally but 'git push origin $tag' failed -- push it by hand so the record is shared"
+    fi
+  else
+    tc_warn "deploy succeeded but creating tag $tag failed -- record it by hand"
+  fi
+  tc_log "run 'tcstatus' to confirm the rig came back up"
+  case "$aly_rc" in
+    0)  tc_log "$aly_summary" ;;
+    11) tc_err "$aly_summary"
+        tc_err "The PLC is deployed and in Run, but the Storage Provider is NOT recording (all of) this machine to"
+        tc_err "the database. Press Start on the recording in the Storage Provider Recorder. Evidence: $aly_ev"
+        tc_err "(To learn the Recorder's start command for an automatic restart: 'tcanalytics capture' while pressing Start.)"
+        rc=11 ;;
+    12) tc_warn "${aly_summary:-analytics: no verdict} -- check the recording by hand (tcstatus). Evidence: $aly_ev" ;;
+  esac
+else
+  case "$rc" in
+    4) tc_err "deploy REFUSED: rig is busy (ADS guard). Nothing was activated." ;;
+    6) tc_err "deploy REFUSED: the tree on the box does not match what tcsync sent. Nothing was activated." ;;
+    7) tc_err "deploy REFUSED: the build did not produce a boot project for BUILD_PLATFORM='${BUILD_PLATFORM}'. Nothing was activated." ;;
+    8) tc_err "deploy REFUSED: the target does not identify as '${EXPECTED_HOSTNAME}' (see log). Wrong machine, or the PLC has no identity yet. Nothing was activated." ;;
+    9) tc_err "ACTIVATED and in Run, but a health symbol did not go TRUE within ${ADS_HEALTH_TIMEOUT}s (see log). Check the machine NOW." ;;
+   10) tc_err "deploy REFUSED: the XAE on the box generated a configuration that is missing parts of the project (see log). Nothing was activated." ;;
+    1) tc_err "deploy FAILED: clean build failed. Nothing was activated." ;;
+    5) tc_err "ACTIVATED but the target did not return to Run -- inspect the rig NOW (tcstatus)." ;;
+    *) tc_err "deploy FAILED (rc=$rc) -- target may be in CONFIG mode; check with tcstatus" ;;
+  esac
+fi
+exit "${rc:-1}"

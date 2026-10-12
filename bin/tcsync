@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# tcsync -- push the agent-editable working tree to the build box (design §4.5).
+#
+# Deliberately NOT a whole-tree rsync. A TwinCAT repo can be hundreds of MB
+# (packages, HMI); the box has all of that already. What changes in the inner
+# loop is PLC source, so that is all we send: a gzipped tar of SYNC_PATHS from
+# the repo's tcdeploy.conf (typically PLC/, a library submodule and SafetyPLC/,
+# well under 1 MB). Everything lands under C:\_tcDeploy\projects\<PROJECT>.
+#
+# This also makes design §6 structural rather than advisory -- the .tsproj and
+# _Config/*.xti are not in the inner-loop sync set, so the agent physically
+# cannot push a hand-edited copy of them.
+
+set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_tclib.sh"
+tc_load_config
+
+read -r -a SYNC_PATHS_ARR <<< "$SYNC_PATHS"            # from tcdeploy.conf
+PRUNE_EXT='TcPOU|TcGVL|TcDUT|TcIO|TcTTO|plcproj|TcPLCProj'
+do_preflight=1; verbose=0; force=0
+
+usage() {
+  cat <<USAGE
+usage: tcsync [--no-preflight] [--full] [--force] [-v]
+
+  --no-preflight   skip the §6 BOM / plcproj-registration checks (not advised)
+  --full           also send FULL_SYNC_EXTRA from tcdeploy.conf (default: _Config/,
+                   the .tsproj and the .sln) -- what tcdeploy needs
+  --force          sync even while a job is running on the build box. Proven to
+                   WEDGE the shell if a build is mid-flight; the
+                   worker's watchdog then kills it at the end of the job budget.
+  -v               list transferred paths
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-preflight) do_preflight=0 ;;
+    --full)         read -r -a _extra <<< "$FULL_SYNC_EXTRA"; SYNC_PATHS_ARR+=("${_extra[@]}") ;;
+    --force)        force=1 ;;
+    -v|--verbose)   verbose=1 ;;
+    -h|--help)      usage; exit 0 ;;
+    *)              tc_die "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+(( do_preflight )) && { "$TC_ROOT/bin/tcpreflight" "$REPO_LOCAL" --quiet --plcproj "$PLC_PROJ" --tsproj "$TSPROJ" || tc_die "pre-flight failed -- fix the above before syncing"; }
+
+tc_ssh_check
+
+# Never change files under a solution the worker has open. That is exactly what
+# wedged the shell for 15 minutes at a time (docs/field-notes.md, "Wedged shell"): the worker now
+# closes the solution after every job, so the only remaining window is a job
+# that is running RIGHT NOW. Refuse unless told otherwise.
+running=$(tc_ps "Get-ChildItem -Path '${REMOTE_ROOT}\\state' -Filter '*.running' -File -ErrorAction SilentlyContinue | Select-Object -ExpandProperty BaseName" 2>/dev/null | tr -d '\r' | grep -v '^$' | paste -sd, - || true)
+if [[ -n "$running" ]]; then
+  if (( force )); then
+    tc_warn "job(s) running on the build box ($running) -- syncing anyway because --force."
+    tc_warn "If that job is a build, this WILL wedge the XAE Shell until its watchdog fires."
+  else
+    tc_die "job(s) still running on the build box: $running. Changing files under an open solution wedges the XAE Shell. Wait for it, or run tcreset if it is stale, or pass --force."
+  fi
+fi
+
+present=()
+for p in "${SYNC_PATHS_ARR[@]}"; do
+  [[ -e "$REPO_LOCAL/$p" ]] && present+=("$p") || tc_warn "skipping absent path: $p"
+done
+(( ${#present[@]} )) || tc_die "nothing to sync"
+
+# Manifest drives remote pruning: any SOURCE file under the synced roots that we
+# did not just send is stale (deleted locally) and gets removed. Build artifacts
+# and other extensions are left alone so the warm build cache survives.
+manifest=$(cd "$REPO_LOCAL" && find "${present[@]}" -type f -not -path '*/.git/*' \
+             | sed 's#\\#/#g' | sort)
+
+tc_ps "\$ErrorActionPreference='Stop'
+New-Item -ItemType Directory -Force -Path '${REMOTE_WORK}' | Out-Null
+New-Item -ItemType Directory -Force -Path '${REMOTE_STATE}' | Out-Null" >/dev/null
+
+tc_log "sending $(printf '%s\n' "$manifest" | wc -l) files from ${present[*]}"
+
+# LINE ENDINGS ARE LOAD-BEARING. The repo's .gitattributes is `* text=auto`, so
+# git stores LF and converts to CRLF on a Windows checkout. tar copies bytes
+# verbatim, so a raw Linux->Windows transfer lands LF files on Windows. Visual
+# Studio's .sln parser REQUIRES CRLF: with LF it cannot parse the project
+# entries, every project loads as vsProjectKindUnmodeled, SolutionContexts goes
+# to 0, and builds silently become no-ops that still report success.
+# That cost an evening. Stage a CRLF-converted copy and ship that.
+stage=$(mktemp -d) || tc_die "could not create staging dir"
+mandir=$(mktemp -d) || tc_die "could not create manifest dir"
+trap 'rm -rf "$stage" "$mandir"' EXIT
+
+# Alongside the conversion, hash every STAGED file (i.e. the bytes that land
+# on the box). tcdeploy's job verifies the tree against this manifest before
+# building, which is the on-box half of the traceability chain: Linux vouches
+# "clean at <sha>", the box proves "and these are those bytes" -- without git.
+REPO_LOCAL="$REPO_LOCAL" STAGE="$stage" PATHS="${present[*]}" HASHOUT="$mandir/${PROJECT}.manifest.sha256" \
+  python3 - <<'PYCONV' || tc_die "line-ending conversion failed"
+import hashlib, os, shutil, sys
+src, dst = os.environ['REPO_LOCAL'], os.environ['STAGE']
+conv = 0
+hashes = []
+for top in os.environ['PATHS'].split():
+    top_path = os.path.join(src, top)
+    if os.path.isfile(top_path):                 # --full adds single files (tsproj, sln)
+        walk = [(os.path.dirname(top_path), [], [os.path.basename(top_path)])]
+    else:
+        walk = os.walk(top_path)
+    for root, dirs, files in walk:
+        dirs[:] = [d for d in dirs if d != '.git']
+        rel = os.path.relpath(root, src)
+        out = os.path.join(dst, rel) if rel != '.' else dst
+        os.makedirs(out, exist_ok=True)
+        for name in files:
+            if name.endswith('.tmc'):
+                continue
+            a, b = os.path.join(root, name), os.path.join(out, name)
+            with open(a, 'rb') as fh:
+                data = fh.read()
+            if b'\x00' in data[:8000]:          # binary: byte-for-byte
+                shutil.copy2(a, b); new = data
+            else:
+                new = data.replace(b'\r\n', b'\n').replace(b'\n', b'\r\n')
+                with open(b, 'wb') as fh:
+                    fh.write(new)
+                if new != data: conv += 1
+            relpath = os.path.normpath(os.path.join(rel, name)).replace(os.sep, '/') if rel != '.' else name
+            hashes.append((hashlib.sha256(new).hexdigest(), relpath))
+hashes.sort(key=lambda t: t[1])
+with open(os.environ['HASHOUT'], 'w') as fh:
+    for h, rp in hashes:
+        fh.write(f"{h}  {rp}\n")
+print(f"  converted {conv} text file(s) to CRLF; hashed {len(hashes)} staged file(s)", file=sys.stderr)
+PYCONV
+
+if ! tar -C "$stage" -czf - . \
+     | tc_ssh "tar -xzf - -C $(printf '%s' "$REMOTE_WORK" | tr '\\' '/')"; then
+  tc_die "transfer failed -- is tar.exe present on the build box? (Windows 10 1803+ ships it in System32)"
+fi
+
+# Prune stale sources, then report what the remote actually holds.
+# The manifest travels as a file in its own tar stream. Embedding 289 paths in
+# an -EncodedCommand payload silently exceeded the Windows command-line limit
+# and surfaced only as ssh exit 255.
+printf '%s\n' "$manifest" > "$mandir/${PROJECT}.manifest.txt"
+tar -C "$mandir" -czf - "${PROJECT}.manifest.txt" "${PROJECT}.manifest.sha256" | tc_ssh "tar -xzf - -C $(printf '%s' "$REMOTE_ROOT" | tr '\\' '/')/state" \
+  || tc_die "failed to send sync manifest"
+
+pruned=$(tc_ps "\$ErrorActionPreference='Stop'
+\$root = '${REMOTE_WORK}'
+\$keep = Get-Content -LiteralPath '${REMOTE_MANIFEST_TXT}' |
+        ForEach-Object { \$_.Trim() } | Where-Object { \$_ } 
+\$keepSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+\$keep | ForEach-Object { [void]\$keepSet.Add(\$_) }
+\$removed = 0
+foreach (\$sub in @($(printf "'%s'," "${present[@]}" | sed 's/,$//'))) {
+  \$base = Join-Path \$root \$sub
+  if (-not (Test-Path \$base)) { continue }
+  Get-ChildItem -LiteralPath \$base -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+    if (\$_.Extension.TrimStart('.') -notmatch '^(${PRUNE_EXT})\$') { return }
+    \$rel = \$_.FullName.Substring(\$root.Length).TrimStart('\\').Replace('\\','/')
+    if (-not \$keepSet.Contains(\$rel)) { Remove-Item -LiteralPath \$_.FullName -Force; \$removed++ }
+  }
+}
+\$removed" | tr -d '\r\n ')
+
+[[ "${pruned:-0}" != "0" ]] && tc_log "pruned ${pruned} stale source file(s) on the build box"
+(( verbose )) && printf '%s\n' "$manifest"
+tc_log "${C_GRN}synced${C_OFF} -> ${BUILD_USER}@${BUILD_HOST}:${REMOTE_WORK}"

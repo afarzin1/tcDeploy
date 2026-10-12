@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# tcscripts -- push windows/*.ps1 + windows/lib/ to <REMOTE_ROOT>\scripts on the build box.
+# Run after editing anything under windows/.
+
+set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_tclib.sh"
+tc_load_site_config   # project-independent: only needs the box
+
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && {
+  echo "usage: tcscripts    push windows/*.ps1 + lib/ to ${REMOTE_ROOT}\\scripts on the build box"; exit 0; }
+
+tc_ssh_check
+
+tc_ps "New-Item -ItemType Directory -Force -Path '${REMOTE_ROOT}\\scripts\\lib' | Out-Null" >/dev/null
+
+tc_log "pushing windows/ -> ${REMOTE_ROOT}\\scripts"
+tar -C "$TC_ROOT/windows" -czf - . \
+  | tc_ssh "tar -xzf - -C $(printf '%s' "$REMOTE_ROOT" | tr '\\' '/')/scripts" \
+  || tc_die "script push failed"
+
+count=$(tc_ps "(Get-ChildItem -Path '${REMOTE_ROOT}\\scripts' -Recurse -Filter '*.ps1' | Measure-Object).Count" | tr -d '\r\n ')
+tc_log "${C_GRN}pushed${C_OFF} ${count} .ps1 files"

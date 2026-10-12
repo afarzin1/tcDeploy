@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# tcreset -- unwedge the build box: kill stranded XAE Shell processes, clear the
+# queue, restart the worker. The remedy when tcbuild times out (design §7: RDP
+# is for eyeballing a wedged shell, this is for fixing it without RDP).
+
+set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_tclib.sh"
+tc_load_site_config   # project-independent: only needs the box
+
+keep_queue=""
+case "${1:-}" in
+  --keep-queue) keep_queue=" -KeepQueue" ;;
+  -h|--help)    echo "usage: tcreset [--keep-queue]   kill a wedged XAE Shell and restart the worker"; exit 0 ;;
+  "")           ;;
+  *)            tc_die "unknown argument: $1 (try --keep-queue)" ;;
+esac
+
+tc_ssh_check
+tc_log "resetting ${BUILD_HOST} ..."
+# 6>&1: reset.ps1 reports through Write-Host. Over a non-interactive SSH session
+# powershell.exe also serialises those information records as CLIXML onto
+# stderr, which is unreadable noise; merging stream 6 into stdout stops that.
+tc_ps "& '${REMOTE_ROOT}\\scripts\\reset.ps1' -Root '${REMOTE_ROOT}'${keep_queue} 6>&1"
+tc_log "${C_GRN}reset issued${C_OFF}"

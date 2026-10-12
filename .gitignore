@@ -1,0 +1,6 @@
+# Your site's build box settings (see etc/tcworkflow.conf)
+etc/tcworkflow.local.conf
+# Local scratch
+*.log
+__pycache__/
+.claude/settings.local.json

@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# tcstatus -- read the target's run state and machine state over ADS.
+#
+# The ADS read happens ON the build box, not here: it already has a TwinCAT
+# router and a configured route to the target (TARGET_NETID), so there is
+# nothing to set up and no ADS route to maintain from Linux.
+
+set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_tclib.sh"
+tc_load_config
+
+json_out=0
+case "${1:-}" in
+  --json)    json_out=1 ;;
+  -h|--help) echo "usage: tcstatus [--json]   read target run state + deploy guards"; exit 0 ;;
+  "")        ;;
+  *)         tc_die "unknown argument: $1 (try --json)" ;;
+esac
+
+tc_require_target
+tc_ssh_check
+jobid="status-$(tc_jobid)"
+
+if [[ "$TC_MODE" == "direct" ]]; then
+  set +e
+  tc_ps "& '${REMOTE_ROOT}\\scripts\\ads-status.ps1' -JobId '${jobid}' -NetId '${TARGET_NETID}' -PlcPort ${ADS_PLC_PORT} -GuardBools '${ADS_GUARD_BOOLS}' -GuardStrings '${ADS_GUARD_STRINGS}'" >/dev/null
+  rc=$?
+  set -e
+else
+  tc_submit_job "$jobid" "$(printf '{"id":"%s","type":"status","netid":"%s","plcport":%s,"guardBools":%s,"guardStrings":%s,"hostnameSymbol":"%s","healthBools":%s,"timeout":120}' \
+      "$jobid" "$TARGET_NETID" "$ADS_PLC_PORT" "$(tc_json_array "$ADS_GUARD_BOOLS")" "$(tc_json_array "$ADS_GUARD_STRINGS")" "$ADS_HOSTNAME_SYMBOL" "$(tc_json_array "$ADS_HEALTH_BOOLS")")"
+  rc=$(tc_wait_job "$jobid" 120) || rc=124
+fi
+
+json=$(tc_fetch_json "$jobid" || true)
+if (( json_out )); then printf '%s\n' "${json:-{\}}"; exit "${rc:-1}"; fi
+
+if [[ -z "$json" ]]; then
+  tc_err "no status returned (rc=$rc)"; tc_fetch_log "$jobid"; exit "${rc:-1}"
+fi
+
+printf '%s' "$json" | TC_EXPECTED_HOSTNAME="$EXPECTED_HOSTNAME" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+G, R, Y, O = "\033[32m", "\033[31m", "\033[33m", "\033[0m"
+if not sys.stderr.isatty(): G = R = Y = O = ""
+sysst, plcst = d.get("systemState","?"), d.get("plcState","?")
+col = G if plcst == "Run" else (Y if plcst in ("Config","Stop") else R)
+netid = d.get("netId","?")
+print(f"target      {netid}")
+hn = d.get("hostname")
+if hn is not None:
+    exp = os.environ.get("TC_EXPECTED_HOSTNAME") or ""
+    shown = hn if hn else "(empty -- identity not acquired)"
+    tag = ""
+    if exp:
+        tag = f" {G}matches EXPECTED_HOSTNAME{O}" if hn == exp else f" {R}EXPECTED {exp}{O}"
+    print(f"machine     {shown}{tag}")
+print(f"system      {sysst}")
+print(f"plc         {col}{plcst}{O}")
+guards = d.get("guards", {})
+if guards:
+    print("guards")
+    for k, v in guards.items():
+        busy = (v is True) or (isinstance(v,str) and v.strip() != "")
+        mark = f"{R}BUSY{O}" if busy else f"{G}clear{O}"
+        shown = "\"" + v + "\"" if isinstance(v,str) else str(v)
+        print(f"  {k:<42} {shown:<10} {mark}")
+health = d.get("health", {})
+if health:
+    print("health")
+    for k, v in health.items():
+        ok = (v is True)
+        mark = G + "ok" + O if ok else R + "NOT OK" + O
+        shown = "unreadable" if v is None else str(v)
+        print(f"  {k:<42} {shown:<10} {mark}")
+err = d.get("error")
+if err:
+    print(f"{R}error{O}       {err}")
+' || printf '%s\n' "$json"
+
+# The Storage Provider's recording of this machine (read-only MQTT; see tcanalytics).
+# Prints nothing for a project without an Analytics Logger.
+ANALYTICS_WATCH="$ANALYTICS_WATCH" ANALYTICS_BROKER="$ANALYTICS_BROKER" ANALYTICS_TOPIC="$ANALYTICS_TOPIC" ANALYTICS_SETTLE="$ANALYTICS_SETTLE" TC_TSPROJ="$REPO_LOCAL/$TSPROJ" "$TC_ROOT/bin/tcanalytics" status || true
+
+exit "${rc:-1}"

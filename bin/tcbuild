@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+# tcbuild -- build the current TwinCAT project on the build box and return terse, actionable errors.
+#
+# Syncs first by default: the agent's loop is edit -> build -> read errors, and
+# a build against a stale tree is worse than useless. Pass --no-sync to skip.
+#
+# Honours TC_MODE (design §7 step 1):
+#   worker = drop a job file, poll for the result   (always correct)
+#   direct = invoke build.ps1 over SSH              (only if the smoke test passed)
+
+set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_tclib.sh"
+tc_load_config
+
+do_sync=1; clean=0; raw=0; visible=0; probe=0; shell_mode="${TC_SHELL_MODE:-com}"; suppress_ui="${TC_SUPPRESS_UI:-true}"
+
+usage() {
+  cat <<USAGE
+usage: tcbuild [--no-sync] [--clean] [--raw]
+
+  --no-sync   build whatever is already on the box
+  --clean     clean before building (slower; use when results look stale)
+  --raw       print the full build log instead of just parsed errors
+  --visible   show the XAE Shell window on the box for this job (diagnostic)
+  --shell-process   start TcXaeShell.exe as a normal process and attach via ROT (instead of COM /Embedding)
+  --no-suppress-ui  leave the shell's dialogs enabled (diagnostic)
+USAGE
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-sync) do_sync=0 ;;
+    --clean)   clean=1 ;;
+    --raw)     raw=1 ;;
+    --visible) visible=1 ;;
+    --probe)   probe=1; raw=1 ;;
+    --shell-process)  shell_mode=process ;;
+    --no-suppress-ui) suppress_ui=false ;;
+    -h|--help) usage; exit 0 ;;
+    *)         tc_die "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+(( do_sync )) && "$TC_ROOT/bin/tcsync"
+tc_ssh_check
+
+jobid="build-$(tc_jobid)"
+started=$(date +%s)
+
+if [[ "$TC_MODE" == "direct" ]]; then
+  tc_log "building (direct mode) ..."
+  set +e
+  tc_ps "& '${REMOTE_ROOT}\\scripts\\build.ps1' -JobId '${jobid}' -WorkDir '${REMOTE_WORK}' -Solution '${SOLUTION}' -Clean:\$$( ((clean)) && echo true || echo false )"
+  rc=$?
+  set -e
+else
+  tc_log "building (worker mode) ..."
+  [[ -n "$BUILD_PLATFORM" ]] || tc_warn "BUILD_PLATFORM is not set in $TC_PROJECT_CONF -- the box builds whatever platform its shell last had selected"
+  jobtype=build; (( probe )) && jobtype=probe
+  tc_submit_job "$jobid" "$(printf '{"id":"%s","type":"'"$jobtype"'","clean":%s,"visible":%s,"workdir":"%s","solution":"%s","configuration":"%s","platform":"%s","tsproj":"%s","mustContain":%s,"shellMode":"%s","suppressUI":%s,"timeout":%s}' \
+      "$jobid" "$( ((clean)) && echo true || echo false )" "$( ((visible)) && echo true || echo false )" "$(tc_json_win "$REMOTE_WORK")" "$SOLUTION" "$BUILD_CONFIGURATION" "$BUILD_PLATFORM" "$TSPROJ" "$(tc_json_array "$BOOT_CONFIG_MUST_CONTAIN")" "$shell_mode" "$suppress_ui" "$JOB_TIMEOUT")"
+  rc=$(tc_wait_job "$jobid") || rc=124
+fi
+
+elapsed=$(( $(date +%s) - started ))
+log=$(tc_fetch_log "$jobid" || true)
+json=$(tc_fetch_json "$jobid" || true)
+
+if (( raw )) || [[ -z "$json" ]]; then
+  [[ -n "$log" ]] && printf '%s\n' "$log"
+else
+  # Terse file:line: message -- the highest-value part of the whole pipeline
+  # (design §4.3). Raw MSBuild output is far too noisy for an agent to act on.
+  # Exit 3 from the parser means "nothing actionable was printed".
+  parsed=0
+  printf '%s' "$json" | TC_REMOTE_WORK="$REMOTE_WORK" TC_REPO_LOCAL="$REPO_LOCAL" python3 -c '
+import json, os, re, sys
+
+# Rewrite C:\_tcDeploy\projects\<PROJECT>\PLC\POUs\MAIN.TcPOU -> PLC/POUs/MAIN.TcPOU so the
+# path points at the file in THIS repo. An error the agent cannot open is an
+# error it cannot fix.
+remote_fs = (os.environ.get("TC_REMOTE_WORK") or "").replace("\\", "/").rstrip("/").lower()
+repo = os.environ.get("TC_REPO_LOCAL") or ""
+
+_index = None
+def by_name(name):
+    """Fallback for a bare object name: find the one source file with that stem."""
+    global _index
+    if _index is None:
+        _index = {}
+        for root, dirs, files in os.walk(repo):
+            dirs[:] = [d for d in dirs if d not in (".git", "Packages", "HMI", "Scope", "_Config")]
+            for f in files:
+                stem, ext = os.path.splitext(f)
+                if ext.lower() in (".tcpou", ".tcgvl", ".tcdut", ".tcio", ".tctto"):
+                    _index.setdefault(stem.lower(), []).append(os.path.relpath(os.path.join(root, f), repo))
+    hits = _index.get(name.lower(), [])
+    return hits[0] if len(hits) == 1 else None
+
+def localise(p):
+    if not p:
+        return "<no file>"
+    q = p.replace("\\", "/")
+    if remote_fs and q.lower().startswith(remote_fs + "/"):
+        return q[len(remote_fs) + 1:]
+    if repo and not os.path.exists(os.path.join(repo, q)):
+        hit = by_name(os.path.splitext(os.path.basename(q))[0])
+        if hit:
+            return hit
+    return q
+
+# --- TwinCAT line -> XML line -------------------------------------------------
+# The compiler reports "MAIN.TcPOU(18)" or "MAIN.TcPOU@runStep(163)". That
+# line counts from the first DECLARATION line of the named object and runs on
+# into its implementation: 18 == 17 declaration lines + implementation line 1
+# (verified against an injected error). The XML file has the
+# declaration and the implementation in two separate CDATA blocks, so the
+# agent needs the translation to land on the right line of the file it edits.
+_layouts = {}
+_SCOPED = ("Method", "Action", "Transition", "Property", "Get", "Set")
+def layout(rel):
+    """scope -> (decl_start, decl_lines, impl_start); scope "" is the POU/GVL/DUT itself."""
+    if rel in _layouts:
+        return _layouts[rel]
+    lay = {}
+    try:
+        with open(os.path.join(repo, rel), "rb") as fh:
+            lines = fh.read().decode("utf-8-sig", errors="replace").split("\n")
+    except OSError:
+        _layouts[rel] = lay
+        return lay
+    stack = []            # scope names, innermost last
+    decl_open = {}        # scope -> decl_start while inside a declaration
+    def cur():
+        return ".".join(stack)
+    for no, ln in enumerate(lines, 1):
+        m = re.search(r"<(%s)\b[^>]*\bName=\"([^\"]+)\"" % "|".join(_SCOPED), ln)
+        if m:
+            stack.append(m.group(2))
+        if "<Declaration><![CDATA[" in ln:
+            decl_open[cur()] = no
+        if "]]></Declaration>" in ln:
+            sc = cur()
+            d0 = decl_open.pop(sc, no)
+            e = lay.setdefault(sc, [d0, 0, None])
+            e[0], e[1] = d0, no - d0 + 1
+        if "<ST><![CDATA[" in ln:
+            e = lay.setdefault(cur(), [None, 0, None])
+            if e[2] is None:
+                e[2] = no
+        for tag in _SCOPED:
+            if ("</%s>" % tag) in ln and stack:
+                stack.pop()
+                break
+    _layouts[rel] = lay
+    return lay
+
+def map_line(rel, scope, tc_line):
+    if not tc_line or not rel or rel.startswith("<"):
+        return None
+    lay = layout(rel)
+    if not lay:
+        return None
+    key = scope or ""
+    ent = lay.get(key)
+    if ent is None and key:
+        # try the last path segment (Property.Get -> Get) and a unique suffix match
+        tail = key.split(".")[-1]
+        cands = [k for k in lay if k == tail or k.endswith("." + key) or k.endswith("." + tail)]
+        ent = lay[cands[0]] if len(cands) == 1 else None
+    if ent is None:
+        return None
+    d0, dn, i0 = ent
+    if tc_line <= dn and d0:
+        return d0 + tc_line - 1
+    if i0 is None:
+        return None
+    return i0 + (tc_line - dn) - 1
+
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(3)
+items = d.get("errors") or []
+errs  = [i for i in items if (i.get("severity") or "").lower() == "error"]
+warns = [i for i in items if (i.get("severity") or "").lower() == "warning"]
+printed = False
+unmapped = 0
+for i in errs + warns:
+    f     = localise(i.get("file"))
+    tc_ln = i.get("line") or 0
+    scope = i.get("scope") or ""
+    sev   = (i.get("severity") or "error").lower()
+    msg   = (i.get("message") or "").strip()
+    ln    = tc_ln
+    if (i.get("source") or "") == "Build":
+        xml = map_line(f, scope, tc_ln)
+        if xml is None:
+            unmapped += 1
+            msg = f"{msg}  [TwinCAT line {tc_ln}, not mapped to an XML line]"
+        else:
+            ln = xml
+    where = f"[{scope}] " if scope else ""
+    print(f"{f}:{ln}: {sev}: {where}{msg}")
+    printed = True
+sys.stdout.flush()   # keep the stderr summary AFTER the stdout listing when both hit a pipe
+if errs or warns:
+    print(f"\n{len(errs)} error(s), {len(warns)} warning(s)", file=sys.stderr)
+if unmapped:
+    print(f"({unmapped} line number(s) could not be mapped -- shown as reported by TwinCAT)", file=sys.stderr)
+bc = d.get("bootConfig")
+if isinstance(bc, dict) and bc.get("ok") is False:
+    print("warning: the build box generated an INCOMPLETE configuration -- missing: " + "; ".join(bc.get("missing") or []), file=sys.stderr)
+    print("         a deploy from this box would be refused (rc 10). The XAE on the box is not processing part of this project.", file=sys.stderr)
+    printed = True
+err = d.get("error")
+if err:
+    print(f"error: {err}", file=sys.stderr)
+    printed = True
+sys.exit(0 if printed else 3)
+' || parsed=$?
+  # A red build with nothing itemised must still explain itself.
+  if (( parsed == 3 )) && [[ "$rc" != "0" && -n "$log" ]]; then
+    tc_warn "no itemised errors came back -- last lines of the build log:"
+    printf '%s\n' "$log" | tail -n 40
+  fi
+fi
+
+if [[ "$rc" == "0" ]]; then
+  tc_log "${C_GRN}build OK${C_OFF} (${elapsed}s)"
+else
+  tc_err "build FAILED (rc=$rc, ${elapsed}s)"
+fi
+exit "${rc:-1}"

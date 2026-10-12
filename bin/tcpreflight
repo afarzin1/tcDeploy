@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+Local pre-flight checks on a TwinCAT working tree (design §6).
+
+Catches the two ways TwinCAT fails *silently* -- a source file missing from
+PLC.plcproj is simply not compiled, and a .TcPOU that lost its UTF-8 BOM can be
+rejected outright -- plus the files the agent is not allowed to hand-edit.
+
+Exit 0 = clean, 1 = errors found, 2 = usage/IO problem.
+"""
+import os, re, sys, argparse, subprocess
+import xml.etree.ElementTree as ET
+
+SRC_EXT = {".TcPOU", ".TcGVL", ".TcDUT", ".TcIO", ".TcTTO"}
+BOM = b"\xef\xbb\xbf"
+def forbidden_patterns(tsproj):
+    """Files the agent must never hand-edit. The .tsproj name comes from tcdeploy.conf."""
+    tsp = re.compile(r"^%s$" % re.escape(tsproj)) if tsproj else re.compile(r"^[^/]+\.tsproj$")
+    return [
+        (tsp,                              "generated system project -- I/O + task + safety config"),
+        (re.compile(r"^_Config/.*\.xti$"), "generated I/O mapping fragment"),
+    ]
+FORBIDDEN = forbidden_patterns(None)
+
+class Report:
+    def __init__(self):
+        self.errors, self.warnings = [], []
+    def error(self, path, msg):   self.errors.append((path, msg))
+    def warn(self, path, msg):    self.warnings.append((path, msg))
+
+def load_plcproj(plcproj):
+    """Return the set of source paths registered under <Compile Include>, repo-relative."""
+    tree = ET.parse(plcproj)
+    registered = set()
+    for el in tree.iter():
+        if not el.tag.endswith("}Compile") and el.tag != "Compile":
+            continue
+        inc = el.get("Include")
+        if inc:
+            registered.add(inc.replace("\\", "/"))
+    return registered
+
+def has_bom_on_disk(repo, rel):
+    try:
+        with open(os.path.join(repo, rel), "rb") as fh:
+            return fh.read(3) == BOM
+    except OSError:
+        return None
+
+def check_bom_stability(repo, modified, rep):
+    """
+    Enforce that an edit does not FLIP a file's BOM state.
+
+    Not 'every file must have a BOM' -- that is not true of TwinCAT projects in
+    general. TwinCAT reads both, and real codebases carry both (older files
+    with a BOM, newer ones without, depending on the tooling that wrote them). What actually breaks things is a
+    wholesale rewrite on Linux silently dropping the BOM off an existing file:
+    it turns a two-line change into a whole-file diff and loses the encoding the
+    file was authored with. So we compare against HEAD rather than an absolute.
+    """
+    for rel in sorted(modified):
+        if os.path.splitext(rel)[1] not in SRC_EXT:
+            continue
+        now = has_bom_on_disk(repo, rel)
+        if now is None:
+            continue
+        try:
+            blob = subprocess.run(["git", "-C", repo, "show", f"HEAD:{rel}"],
+                                  capture_output=True, timeout=30)
+            if blob.returncode != 0:
+                continue                      # new file -- either encoding is fine
+            before = blob.stdout[:3] == BOM
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if before and not now:
+            rep.error(rel, "edit DROPPED the UTF-8 BOM this file had in HEAD. "
+                           "Restore it -- a whole-file rewrite on Linux is the usual cause.")
+        elif now and not before:
+            rep.error(rel, "edit ADDED a UTF-8 BOM this file did not have in HEAD. "
+                           "Remove it (CONVENTIONS.md §8: new files are BOM-less).")
+
+def check_xml(repo, rel, rep):
+    """A broken CDATA block or a mangled Id= attribute shows up here first."""
+    try:
+        ET.parse(os.path.join(repo, rel))
+    except ET.ParseError as e:
+        rep.error(rel, f"not well-formed XML: {e}")
+
+def changed_files(repo):
+    """Files modified vs HEAD -- used only to scope the 'do not hand-edit' check."""
+    try:
+        out = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
+                             capture_output=True, text=True, timeout=30)
+        if out.returncode != 0:
+            return None
+        return {line[3:].strip().strip('"') for line in out.stdout.splitlines() if line.strip()}
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+def main():
+    ap = argparse.ArgumentParser(description="TwinCAT working-tree pre-flight")
+    ap.add_argument("repo", nargs="?", default=os.environ.get("REPO_LOCAL"))
+    ap.add_argument("--plc-dir", default="PLC")
+    ap.add_argument("--plcproj", default="PLC/PLC.plcproj")
+    ap.add_argument("--tsproj", default=None, help="name of the system project at the repo root (default: any *.tsproj)")
+    ap.add_argument("--quiet", action="store_true", help="print only problems")
+    args = ap.parse_args()
+
+    if not args.repo or not os.path.isdir(args.repo):
+        print("preflight: repo path missing or not a directory", file=sys.stderr)
+        return 2
+    repo, rep = os.path.abspath(args.repo), Report()
+
+    global FORBIDDEN
+    FORBIDDEN = forbidden_patterns(args.tsproj)
+    plcproj = os.path.join(repo, args.plcproj)
+    if not os.path.isfile(plcproj):
+        print(f"preflight: {args.plcproj} not found", file=sys.stderr)
+        return 2
+    try:
+        registered = load_plcproj(plcproj)
+    except ET.ParseError as e:
+        print(f"preflight: {args.plcproj} is not well-formed XML: {e}", file=sys.stderr)
+        return 1
+
+    # --- walk the PLC source tree -------------------------------------------
+    plc_dir = os.path.join(repo, args.plc_dir)
+    on_disk = set()
+    for dirpath, _dirs, files in os.walk(plc_dir):
+        for name in files:
+            if os.path.splitext(name)[1] not in SRC_EXT:
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, name), repo).replace(os.sep, "/")
+            on_disk.add(rel)
+            check_xml(repo, rel, rep)
+
+    # Registration is expressed relative to the .plcproj, not the repo root.
+    proj_prefix = os.path.dirname(args.plcproj).replace(os.sep, "/")
+    reg_abs = {f"{proj_prefix}/{r}" if proj_prefix else r for r in registered}
+
+    for rel in sorted(on_disk - reg_abs):
+        if rel == args.plcproj:
+            continue
+        rep.error(rel, "on disk but NOT registered in PLC.plcproj <Compile Include> "
+                       "-- TwinCAT will silently ignore it")
+    for rel in sorted(reg_abs - on_disk):
+        if os.path.splitext(rel)[1] in SRC_EXT:
+            rep.error(rel, "registered in PLC.plcproj but missing on disk")
+
+    # --- files the agent must not hand-edit ---------------------------------
+    dirty = changed_files(repo)
+    if dirty is None:
+        rep.warn("(git)", "could not read git status -- skipped BOM-stability and hand-edit checks")
+    else:
+        check_bom_stability(repo, dirty, rep)
+        for rel in sorted(dirty):
+            for pat, why in FORBIDDEN:
+                if pat.match(rel):
+                    rep.error(rel, f"modified, but this file is out of bounds ({why}). "
+                                   "Revert it and make the change in the XAE GUI instead.")
+
+    # --- output --------------------------------------------------------------
+    for path, msg in rep.warnings:
+        print(f"{path}: warning: {msg}")
+    for path, msg in rep.errors:
+        print(f"{path}: error: {msg}")
+
+    if rep.errors:
+        print(f"\npreflight: {len(rep.errors)} error(s) -- not syncing.", file=sys.stderr)
+        return 1
+    if not args.quiet:
+        n = len(dirty) if dirty else 0
+        print(f"preflight: OK ({len(on_disk)} source files registered, "
+              f"{n} modified, BOM stable)")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

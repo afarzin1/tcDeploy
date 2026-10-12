@@ -1,0 +1,9 @@
+* text=auto
+# Executed on Linux (bash) or shipped to Windows verbatim by tcscripts; PowerShell
+# 5.1 reads LF fine, bash does not read CRLF at all. Keep both LF everywhere.
+bin/*          text eol=lf
+*.sh           text eol=lf
+*.py           text eol=lf
+*.ps1          text eol=lf
+*.conf         text eol=lf
+*.md           text eol=lf

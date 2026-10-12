@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# tcscreen -- see (and poke) the build box's interactive desktop from Linux.
+#
+# The worker drives an INVISIBLE XAE Shell in the autologon session, so when a
+# build hangs on a modal dialog nothing on the Linux side can tell you what it
+# says. tcscreen registers a one-off scheduled task in that session (an SSH
+# logon is session 0 and cannot see it), which runs windows/screen.ps1:
+# desktop screenshot, one PNG per visible XAE window (PrintWindow, so off-screen
+# dialogs render), and the text, buttons and edit boxes of each via UI
+# Automation. It bypasses the job queue on purpose: you need it most when the
+# worker is wedged. Nothing is installed and no port is opened.
+#
+# It will type what you give it, but it will not read and solve a licence
+# CAPTCHA for you: a person reads the code from the screenshot, then --type.
+
+set -euo pipefail
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/_tclib.sh"
+tc_load_site_config   # project-independent: only needs the box
+
+usage() {
+  cat <<USAGE
+usage: tcscreen [-o DIR] [--process NAME] [--window TITLE]
+                [--click BUTTON | --type TEXT [--field NAME] | --key KEYS]
+
+  (no action)        capture: desktop.png, win-<n>.png per visible window of
+                     the process, and windows.txt with each window's text
+  --click BUTTON     press the button with that name (case-insensitive, & ignored)
+  --type TEXT        set the text of the first enabled edit box
+  --field NAME       ... or of the one with this name / automation id
+  --key KEYS         send keys in SendKeys syntax ({ENTER}, {ESC}, %{F4})
+  --window TITLE     act only on windows whose title contains TITLE
+  --process NAME     whose windows to capture and act on [TcXaeShell]
+  -o DIR             where to put the files [\${TMPDIR:-/tmp}/tcscreen/<id>]
+
+After an action it captures again (after-*.png) so you see what happened.
+exit codes: 0 ok; 1 failed to run; 3 action found nothing to act on / refused
+USAGE
+}
+
+out=""; process="TcXaeShell"; window=""; action=""; name=""; text=""; field=""; keys=""
+need() { [[ $# -ge 2 && -n "$2" ]] || tc_die "$1 needs a value (see --help)"; }
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o)         need "$@"; out="$2"; shift ;;
+    --process)  need "$@"; process="$2"; shift ;;
+    --window)   need "$@"; window="$2"; shift ;;
+    --click)    need "$@"; action=click; name="$2"; shift ;;
+    --type)     [[ $# -ge 2 ]] || tc_die "--type needs a value"; action=type; text="$2"; shift ;;
+    --field)    need "$@"; field="$2"; shift ;;
+    --key)      need "$@"; action=key; keys="$2"; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    *)          tc_die "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+id="screen-$(tc_jobid)"
+out="${out:-${TMPDIR:-/tmp}/tcscreen/$id}"
+mkdir -p "$out"
+
+req=$(python3 -c 'import json,sys; a=sys.argv[1:]; print(json.dumps(dict(zip(["process","window","action","name","text","field","keys"],a))))' \
+      "$process" "$window" "$action" "$name" "$text" "$field" "$keys")
+enc=$(printf '%s' "$req" | base64 -w0)
+rdir="${REMOTE_ROOT}\\tmp\\${id}"
+task="tcscreen-${id#screen-}"
+
+tc_ssh_check
+tc_ps "Test-Path '${REMOTE_ROOT}\\scripts\\screen.ps1'" | grep -q True \
+  || tc_die "screen.ps1 is not on the box -- run tcscripts first"
+
+# /IT = run only in the user's interactive session; that IS the point. /ST is
+# irrelevant (the task is started by /Run and deleted afterwards).
+tc_ps "New-Item -ItemType Directory -Force -Path '$rdir' | Out-Null
+[IO.File]::WriteAllBytes('$rdir\\request.json', [Convert]::FromBase64String('$enc'))
+\$tr = 'powershell -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File ${REMOTE_ROOT}\\scripts\\screen.ps1 -Dir $rdir'
+schtasks /Create /F /TN '$task' /SC ONCE /ST 23:59 /IT /TR \$tr 2>&1 | Out-Null
+if (\$LASTEXITCODE) { throw 'schtasks /Create failed' }
+schtasks /Run /TN '$task' 2>&1 | Out-Null
+if (\$LASTEXITCODE) { throw 'schtasks /Run failed -- is the build user logged on (autologon)?' }" >/dev/null \
+  || tc_die "could not start the capture task on the box"
+
+cleanup() { tc_ps "schtasks /Delete /F /TN '$task' 2>&1 | Out-Null; Remove-Item -Recurse -Force -LiteralPath '$rdir' -ErrorAction SilentlyContinue" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+rc=""; waited=0; limit=90
+while (( waited < limit )); do
+  rc=$(tc_ps "\$p='$rdir\\done.txt'; if (Test-Path \$p) { (Get-Content -LiteralPath \$p -Raw).Trim() }" 2>/dev/null | tr -d '\r\n ')
+  [[ -n "$rc" ]] && break
+  sleep 2; waited=$(( waited + 2 ))
+done
+[[ -n "$rc" ]] || tc_die "no result after ${limit}s -- is the autologon session up? (a locked or signed-out desktop cannot be captured)"
+
+tc_ssh "tar -czf - -C $(printf '%s' "$rdir" | tr '\\' '/') ." | tar -xzf - -C "$out" \
+  || tc_die "could not fetch the capture from the box"
+rm -f "$out/request.json" "$out/done.txt"
+
+tr -d '\r' < "$out/windows.txt" | sed 's/^\xEF\xBB\xBF//'
+echo
+tc_log "files in $out:"
+( cd "$out" && ls -1 ./*.png 2>/dev/null | sed 's|^\./|    |' ) >&2
+[[ -f "$out/action.txt" ]] && tc_log "action: $(tr -d '\r' < "$out/action.txt")"
+exit "$rc"

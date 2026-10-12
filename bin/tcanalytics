@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""tcanalytics -- is the TwinCAT Analytics Storage Provider still recording this machine?
+
+Problem this watches for (docs/field-notes.md, "Analytics Storage Provider"): after an activation, the
+Storage Provider sometimes stops its recording of the machine's stream
+("New SymbolInfo received. Symbolinfo differs from current SymbolInfo.
+Stopping recording.") and does not restart it, although the PLC keeps
+publishing to MQTT. Someone has to notice and press Start in the Recorder.
+It is not reliably reproducible, so tcdeploy collects evidence on every
+deploy instead: how long the stream was offline, what the provider logged
+about this machine, and whether each of its recordings is still receiving.
+
+Everything is READ-ONLY MQTT on the broker the PLC streams to. The Storage
+Provider publishes its log (…/Messages/…), per-storage statistics
+(…/Services/Statistic/Desc) and recordings there; nothing is sent to it.
+
+  tcanalytics status              one-shot: which provider records this project's topics, and how much
+  tcanalytics watch --evidence F  used by tcdeploy: watch across a deploy. SIGUSR1 = "the
+                                  deploy finished", then settle, print a verdict, exit:
+                                  0 recordings survived / nothing to watch, 11 a recording
+                                  STOPPED, 12 could not tell
+  tcanalytics capture [-s SEC] [-o FILE]
+                                  record ALL non-sample traffic to a file, e.g. while
+                                  someone presses Stop/Start in the Recorder, to learn the
+                                  (undocumented) command the Recorder sends
+
+What to watch comes from the project's .tsproj: the Analytics Logger's MQTT
+broker and every stream's MainTopic. A project without an Analytics Logger
+has nothing to watch and every command is a quiet no-op. Overrides, from the
+environment or the project's tcdeploy.conf:
+  ANALYTICS_WATCH    off = never watch this project [auto]
+  ANALYTICS_BROKER   host[:port], instead of the .tsproj's
+  ANALYTICS_TOPIC    MainTopic(s), space-separated, instead of the .tsproj's
+  ANALYTICS_SETTLE   max seconds to wait after the deploy for a verdict [110]
+"""
+import json, os, re, signal, sys, threading, time
+
+STOP_WORDS = ("Stopping recording", "Recording finished", "cancelled", "Record not Started")
+PROV = "+/TcAnalyticsStorageProvider/+"
+
+
+# ------------------------------------------------------------------ config --
+def find_conf():
+    path = os.environ.get("TC_PROJECT_CONF")
+    if path:
+        return path
+    d = os.getcwd()
+    while True:
+        if os.path.isfile(os.path.join(d, "tcdeploy.conf")):
+            return os.path.join(d, "tcdeploy.conf")
+        if d == os.path.dirname(d):
+            return None
+        d = os.path.dirname(d)
+
+
+def conf_values(path):
+    out = {}
+    for line in open(path, encoding="utf-8", errors="replace") if path else []:
+        k, eq, v = line.strip().partition("=")
+        if eq and re.fullmatch(r"[A-Z_]+", k):
+            out[k] = v.split("#")[0].strip().strip('"').strip("'")
+    return out
+
+
+def tsproj_path(conf, c):
+    """TC_TSPROJ (tcdeploy/tcstatus pass it), else the conf's TSPROJ / SOLUTION stem."""
+    if os.environ.get("TC_TSPROJ"):
+        return os.environ["TC_TSPROJ"]
+    if not conf:
+        return None
+    root = c.get("REPO_LOCAL") or os.path.dirname(conf)
+    name = c.get("TSPROJ") or (c.get("PROJECT") or c.get("SOLUTION", "").removesuffix(".sln")) + ".tsproj"
+    return os.path.join(root, name)
+
+
+def from_tsproj(path):
+    """(broker host, port, [MainTopic, ...]) of the Analytics Logger, or None."""
+    try:
+        s = open(path, encoding="utf-8-sig", errors="replace").read()
+    except (OSError, TypeError):
+        return None
+    if "<ActivateAlyLogger>true</ActivateAlyLogger>" not in s:
+        return None
+    brokers = re.findall(r"<Broker>([^<]+)</Broker>\s*<BrokerPort>(\d+)</BrokerPort>", s)
+    topics = sorted({t.strip() for t in re.findall(r"<MainTopic>([^<]*)</MainTopic>", s) if t.strip()})
+    if not brokers or not topics:
+        return None
+    return brokers[0][0], int(brokers[0][1]), topics
+
+
+def cfg():
+    """Returns (host, port, [topics], settle) or None when there is nothing to watch."""
+    conf = find_conf()
+    c = conf_values(conf)
+    get = lambda k, d="": os.environ.get(k) or c.get(k) or d
+    if get("ANALYTICS_WATCH", "auto").lower() in ("off", "0", "no", "false"):
+        return None
+    host, port, topics = None, 1883, []
+    auto = from_tsproj(tsproj_path(conf, c))
+    if auto:
+        host, port, topics = auto
+    if get("ANALYTICS_BROKER"):
+        h, _, p = get("ANALYTICS_BROKER").partition(":")
+        host, port = h, int(p or 1883)
+    if get("ANALYTICS_TOPIC"):
+        topics = get("ANALYTICS_TOPIC").split()
+    if not host or not topics:
+        return None
+    return host, port, topics, int(get("ANALYTICS_SETTLE", "110"))
+
+
+def mqtt_client(name):
+    try:
+        import paho.mqtt.client as mqtt
+    except ImportError:
+        print("analytics: UNKNOWN -- python3 paho-mqtt is not installed (apt install python3-paho-mqtt)", flush=True)
+        sys.exit(12)
+    try:
+        return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"tcdeploy-{name}-{os.getpid()}")
+    except AttributeError:          # paho < 2
+        return mqtt.Client(client_id=f"tcdeploy-{name}-{os.getpid()}")
+
+
+def hhmmss(t=None):
+    return time.strftime("%H:%M:%S", time.localtime(t or time.time()))
+
+
+# ------------------------------------------------------------------- watch --
+class Watch:
+    """Collects, for a set of MainTopics: stream online/offline (<topic>/Desc),
+    the provider's statistics for every recording under those topics, and
+    the provider/storage log lines about them. paho's thread appends; the
+    main thread reads after it stops."""
+
+    def __init__(self, topics, evidence=None):
+        self.topics = set(topics)
+        self.evidence = open(evidence, "a", buffering=1) if evidence else None
+        self.online = []            # (t, maintopic, bool)
+        self.stats = []             # (t, provider, storageGuid, recorded topic, messages_Received, start)
+        self.log = []               # (t, provider, storageGuid|None, message)
+        self.storages = set()       # storages that record one of our topics
+        self.connected = threading.Event()
+
+    @staticmethod
+    def main(recorded):
+        return recorded.split("/")[0]
+
+    def note(self, kind, **kw):
+        if self.evidence:
+            self.evidence.write(json.dumps({"t": time.time(), "at": hhmmss(), "kind": kind, **kw}) + "\n")
+
+    def on_connect(self, c, u, *a):
+        c.subscribe([(f"{t}/Desc", 0) for t in sorted(self.topics)] +
+                    [(f"{PROV}/Services/Statistic/Desc", 0), (f"{PROV}/Messages/+", 0),
+                     (f"{PROV}/Slaves/+/Messages/+", 0)])
+        self.connected.set()
+
+    def on_message(self, c, u, m):
+        now = time.time()
+        try:
+            p = json.loads(m.payload.decode("utf-8"))
+        except Exception:
+            return
+        t = m.topic
+        prov = t.split("/")[0].removesuffix("_StorageProvider")
+        if t.endswith("/Desc") and t[:-5] in self.topics:
+            if not m.retain and isinstance(p, dict) and "Online" in p:
+                self.online.append((now, t[:-5], bool(p["Online"])))
+                self.note("stream", topic=t[:-5], online=bool(p["Online"]), plc_time=p.get("Timestamp"))
+        elif t.endswith("/Services/Statistic/Desc"):
+            for s in p.get("storages", []) if isinstance(p, dict) else []:
+                for r in s.get("recordings", []):
+                    rt = r.get("topic", "")
+                    if self.main(rt) in self.topics:
+                        self.storages.add(s.get("guid"))
+                        self.stats.append((now, prov, s.get("guid"), rt, r.get("messages_Received"), r.get("start")))
+                        self.note("stat", provider=prov, storage=s.get("guid"), topic=rt, state=s.get("state"),
+                                  messages=r.get("messages_Received"), start=r.get("start"), retained=m.retain)
+        elif "/Messages/" in t and isinstance(p, dict) and "message" in p and not m.retain:
+            msg = p["message"]
+            slave = t.split("/Slaves/")[1].split("/")[0] if "/Slaves/" in t else None
+            if any(tp in msg for tp in self.topics) or (slave and slave in self.storages):
+                self.log.append((now, prov, slave, msg))
+                self.note("log", provider=prov, storage=slave, message=msg, provider_time=p.get("timestamp"))
+
+    def run(self, host, port):
+        self.c = mqtt_client("analytics")
+        self.c.on_connect, self.c.on_message = self.on_connect, self.on_message
+        try:
+            self.c.connect(host, port, 30)
+        except OSError:
+            return False
+        self.c.loop_start()
+        return self.connected.wait(10)
+
+    def stop(self):
+        try:
+            self.c.loop_stop(); self.c.disconnect()
+        except Exception:
+            pass
+
+
+def lines_about(w, rt, storage):
+    """Provider/storage log lines that concern recording `rt`: ones naming it
+    (or its MainTopic, for a recording of the bare MainTopic), plus lines of
+    its storage that name no topic at all."""
+    named = re.compile(re.escape(rt) + r"(?![\w/])")     # Logger must not match Logger_Fast
+    out = []
+    for _, _, sg, m in w.log:
+        if named.search(m):
+            out.append(m)
+        elif sg == storage and not any(tp in m for tp in w.topics):
+            out.append(m)
+    return out
+
+
+def decide(w, t_done, host):
+    """Verdict per recording that existed before the deploy (by recorded
+    topic). Returns (rc, summary line): 11 if any stopped, else 12 if any
+    could not be judged, else 0."""
+    before = {}
+    for s in w.stats:
+        if s[0] <= t_done:
+            before[s[3]] = s
+    if not before:
+        seen = sorted({s[3] for s in w.stats})
+        if seen:
+            return 0, f"analytics: {', '.join(seen)} recorded (started during the deploy)"
+        return 0, f"analytics: {' '.join(sorted(w.topics))} not recorded by any Storage Provider on {host} (nothing to check)"
+
+    parts, worst = [], 0
+    for rt, base in sorted(before.items()):
+        mt = w.main(rt)
+        offs = [t for t, tp, o in w.online if tp == mt and not o]
+        ons = [t for t, tp, o in w.online if tp == mt and o]
+        t_on = ons[-1] if ons else None
+        gap = f"{t_on - offs[0]:.1f}s" if offs and t_on and t_on > offs[0] else "not seen"
+        after = [s for s in w.stats if s[3] == rt and t_on and s[0] > t_on]
+        stop = [m for m in lines_about(w, rt, base[2]) if any(sw in m for sw in STOP_WORDS)]
+        rising = len(after) >= 2 and None not in (after[0][4], after[-1][4]) and after[-1][4] > after[0][4]
+        if stop and not rising:
+            v, rc = f"STOPPED ({stop[0][:140]})", 11
+        elif not after and t_on:
+            v, rc = f"STOPPED ({base[1]} no longer reports it)", 11
+        elif rising:
+            v, rc = f"recording ({after[0][4]} -> {after[-1][4]})", 0
+        elif not t_on:
+            v, rc = "UNKNOWN (stream never reported back online)", 12
+        else:
+            v, rc = "UNKNOWN (not enough statistics after the restart)", 12
+        parts.append(f"{rt} on {base[1]}: {v}, offline {gap}")
+        worst = 11 if 11 in (worst, rc) else max(worst, rc)
+    return worst, "analytics: " + "; ".join(parts)
+
+
+# ---------------------------------------------------------------- commands --
+def cmd_status():
+    c = cfg()
+    if not c:
+        return 0                    # no Analytics Logger in this project: nothing to show
+    host, port, topics, _ = c
+    w = Watch(topics)
+    if not w.run(host, port):
+        print(f"recording   ? (broker {host}:{port} unreachable)"); return 12
+    deadline = time.time() + 4      # statistics are retained; they arrive almost at once
+    while time.time() < deadline and not w.stats:
+        time.sleep(0.2)
+    time.sleep(0.5)
+    w.stop()
+    last = {}
+    for s in w.stats:
+        last[(s[1], s[3])] = s
+    for (prov, rt), s in sorted(last.items()):
+        print(f"recording   {rt} on {prov}: {s[4]} messages since {str(s[5])[:19].replace('T', ' ')}")
+    missing = sorted(set(topics) - {w.main(rt) for _, rt in last})
+    for t in missing:
+        print(f"recording   NONE -- no Storage Provider on {host} records {t}")
+    return 11 if missing else 0
+
+
+def cmd_watch(evidence):
+    c = cfg()
+    done = threading.Event()
+    signal.signal(signal.SIGUSR1, lambda *a: done.set())
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    if not c:
+        done.wait(); return 0       # nothing to watch: no output, tcdeploy says nothing
+    host, port, topics, settle = c
+    w = Watch(topics, evidence)
+    if not w.run(host, port):
+        done.wait()
+        print(f"analytics: UNKNOWN -- could not reach broker {host}:{port}, no evidence collected", flush=True)
+        return 12
+    w.note("start", topics=sorted(topics), broker=f"{host}:{port}")
+    done.wait()
+    t_done = time.time()
+    w.note("deploy-finished")
+
+    # Settle: per recording, wait for its stream to be back online and two
+    # statistics updates after that (the provider publishes about every 35 s),
+    # or for a stop line about it; bounded by `settle`.
+    def settled():
+        for rt, base in {s[3]: s for s in w.stats if s[0] <= t_done}.items():
+            if any(any(sw in m for sw in STOP_WORDS) for m in lines_about(w, rt, base[2])):
+                continue
+            ons = [t for t, tp, o in w.online if tp == w.main(rt) and o]
+            if not ons or len([s for s in w.stats if s[3] == rt and s[0] > ons[-1]]) < 2:
+                return False
+        return True
+    while time.time() - t_done < settle and not settled():
+        time.sleep(1)
+    w.stop()
+
+    rc, summary = decide(w, t_done, host)
+    w.note("verdict", rc=rc, summary=summary, provider_log=[m for *_, m in w.log])
+    print(summary, flush=True)      # stdout only, verdict FIRST: tcdeploy takes line 1 as the summary
+    for _, prov, _, m in w.log:
+        print(f"  {prov}: {m[:200]}", flush=True)
+    return rc
+
+
+def cmd_capture(seconds, out):
+    c = cfg()
+    if not c:
+        print("tcanalytics: no Analytics Logger broker for this project (set ANALYTICS_BROKER)", file=sys.stderr)
+        return 12
+    host, port, topics, _ = c
+    f = open(out, "a", buffering=1)
+    t0 = time.time()
+
+    def on_message(cl, u, m):
+        if m.topic.endswith("/Bin/Tx/Data") or (m.retain and time.time() - t0 < 5):
+            return
+        try:
+            p = m.payload.decode("utf-8")
+        except UnicodeDecodeError:
+            p = f"<binary {len(m.payload)}B>"
+        f.write(json.dumps({"at": hhmmss(), "topic": m.topic, "retain": m.retain, "qos": m.qos, "payload": p}) + "\n")
+    cl = mqtt_client("capture")
+    cl.on_message = on_message
+    cl.on_connect = lambda cl, *a: cl.subscribe("#", 0)
+    cl.connect(host, port, 30)
+    cl.loop_start()
+    print(f"capturing {host}:{port} (all topics except sample data) to {out} for {seconds}s -- Ctrl-C to stop", file=sys.stderr)
+    try:
+        time.sleep(seconds)
+    except KeyboardInterrupt:
+        pass
+    cl.loop_stop(); cl.disconnect()
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__); return 0
+    if argv[0] == "status":
+        return cmd_status()
+    if argv[0] == "watch":
+        return cmd_watch(argv[argv.index("--evidence") + 1] if "--evidence" in argv else None)
+    if argv[0] == "capture":
+        secs = int(argv[argv.index("-s") + 1]) if "-s" in argv else 600
+        out = argv[argv.index("-o") + 1] if "-o" in argv else f"analytics-capture-{time.strftime('%Y%m%dT%H%M%S')}.jsonl"
+        return cmd_capture(secs, out)
+    print(f"tcanalytics: unknown command {argv[0]} (see --help)", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
